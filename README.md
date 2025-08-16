@@ -158,7 +158,7 @@ All program logs are written to `stderr` and can be captured separately:
 
 ## Permissions
 
-There is no provision in the code to pre-emptively check for the required `NSAudioCaptureUsageDescription` permission, so you'll be prompted the first time AudioTee tries to record anything. Note that some terminal emulators like iTerm don't always prompt for these permissions (though the macOS builtin terminal definitely does), so you might need to grant them ahead of time if audiotee runs but never records anything.
+There is no provision in the code to pre-emptively check for the required `NSAudioCaptureUsageDescription` permission, so you'll be prompted the first time AudioTee tries to record anything. When using `--mic`, you'll also need to grant microphone access permissions. Note that some terminal emulators like iTerm don't always prompt for these permissions (though the macOS builtin terminal definitely does), so you might need to grant them ahead of time if audiotee runs but never records anything.
 
 If you want to check and/or request permissions ahead of time, check out [AudioCap's fantastic TCC probing approach](https://github.com/insidegui/AudioCap/blob/main/AudioCap/ProcessTap/AudioRecordingPermission.swift). 
 

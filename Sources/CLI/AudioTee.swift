@@ -8,20 +8,22 @@ struct AudioTee {
   var stereo: Bool = false
   var sampleRate: Double?
   var chunkDuration: Double = 0.2
+  var captureMicrophone: Bool = false
 
   init() {}
 
   static func main() {
     let parser = SimpleArgumentParser(
       programName: "audiotee",
-      abstract: "Capture system audio and stream to stdout",
+      abstract: "Capture system audio and/or microphone input and stream to stdout",
       discussion: """
-        AudioTee captures system audio using Core Audio taps and streams it as structured output.
+        AudioTee captures system audio using Core Audio taps and optionally microphone input, streaming as structured output.
 
         Process filtering:
         • include-processes: Only tap specified process IDs (empty = all processes)
         • exclude-processes: Tap all processes except specified ones
         • mute: How to handle processes being tapped
+        • mic: Also capture microphone input alongside system audio
 
         Examples:
           audiotee                              # Auto format, tap all processes
@@ -31,6 +33,7 @@ struct AudioTee {
           audiotee --include-processes 1234 5678 9012  # Tap only these processes
           audiotee --exclude-processes 1234 5678       # Tap everything except these
           audiotee --mute                       # Mute processes being tapped
+          audiotee --mic                        # Also capture microphone input
         """
     )
 
@@ -42,6 +45,7 @@ struct AudioTee {
       name: "exclude-processes", help: "Process IDs to exclude (space-separated)")
     parser.addFlag(name: "mute", help: "Mute processes being tapped")
     parser.addFlag(name: "stereo", help: "Records in stereo")
+    parser.addFlag(name: "mic", help: "Also capture microphone input")
     parser.addOption(
       name: "sample-rate",
       help: "Target sample rate (8000, 16000, 22050, 24000, 32000, 44100, 48000)")
@@ -59,6 +63,7 @@ struct AudioTee {
       audioTee.excludeProcesses = try parser.getArrayValue("exclude-processes", as: Int32.self)
       audioTee.mute = parser.getFlag("mute")
       audioTee.stereo = parser.getFlag("stereo")
+      audioTee.captureMicrophone = parser.getFlag("mic")
       audioTee.sampleRate = try parser.getOptionalValue("sample-rate", as: Double.self)
       audioTee.chunkDuration = try parser.getValue("chunk-duration", as: Double.self)
 
@@ -111,36 +116,88 @@ struct AudioTee {
       processes: processes,
       muteBehavior: mute ? .muted : .unmuted,
       isExclusive: isExclusive,
-      isMono: !stereo
+      isMono: !stereo,
+      captureMicrophone: captureMicrophone
     )
 
-    let audioTapManager = AudioTapManager()
-    do {
-      try audioTapManager.setupAudioTap(with: tapConfig)
-    } catch AudioTeeError.pidTranslationFailed(let failedPIDs) {
-      Logger.error(
-        "Failed to translate process IDs to audio objects",
-        context: [
-          "failed_pids": failedPIDs.map(String.init).joined(separator: ", "),
-          "suggestion": "Check that the process IDs exist and are running",
-        ])
-      throw ExitCode.failure
-    } catch {
-      Logger.error(
-        "Failed to setup audio tap", context: ["error": String(describing: error)])
-      throw ExitCode.failure
-    }
-
-    guard let deviceID = audioTapManager.getDeviceID() else {
-      Logger.error("Failed to get device ID from audio tap manager")
-      throw ExitCode.failure
-    }
-
     let outputHandler = BinaryAudioOutputHandler()
-    let recorder = AudioRecorder(
-      deviceID: deviceID, outputHandler: outputHandler, convertToSampleRate: sampleRate,
-      chunkDuration: chunkDuration)
-    recorder.startRecording()
+    var systemAudioRecorder: AudioRecorder?
+    var microphoneRecorder: MicrophoneAudioRecorder?
+    
+    // Setup system audio recording (always enabled unless only microphone is requested)
+    if !captureMicrophone || true { // For now, always capture system audio when available
+      let audioTapManager = AudioTapManager()
+      do {
+        try audioTapManager.setupAudioTap(with: tapConfig)
+      } catch AudioTeeError.pidTranslationFailed(let failedPIDs) {
+        Logger.error(
+          "Failed to translate process IDs to audio objects",
+          context: [
+            "failed_pids": failedPIDs.map(String.init).joined(separator: ", "),
+            "suggestion": "Check that the process IDs exist and are running",
+          ])
+        throw ExitCode.failure
+      } catch {
+        Logger.error(
+          "Failed to setup audio tap", context: ["error": String(describing: error)])
+        throw ExitCode.failure
+      }
+
+      guard let deviceID = audioTapManager.getDeviceID() else {
+        Logger.error("Failed to get device ID from audio tap manager")
+        throw ExitCode.failure
+      }
+
+      systemAudioRecorder = AudioRecorder(
+        deviceID: deviceID, outputHandler: outputHandler, convertToSampleRate: sampleRate,
+        chunkDuration: chunkDuration)
+    }
+    
+    // Setup microphone recording if requested
+    if captureMicrophone {
+      do {
+        microphoneRecorder = try MicrophoneAudioRecorder(
+          outputHandler: outputHandler, convertToSampleRate: sampleRate, chunkDuration: chunkDuration)
+        Logger.info("Microphone capture enabled")
+      } catch {
+        Logger.error("Failed to setup microphone recording", context: ["error": String(describing: error)])
+        Logger.info("Continuing with system audio only...")
+        // Don't throw - continue with system audio only
+      }
+    }
+    
+    // Start recording from both sources
+    if let sysRecorder = systemAudioRecorder {
+      do {
+        try sysRecorder.startRecording()
+      } catch {
+        Logger.error("Failed to start system audio recording", context: ["error": String(describing: error)])
+        Logger.info("Continuing with microphone only (if enabled) or exiting...")
+        systemAudioRecorder = nil  // Clear the recorder so we don't try to stop it later
+        
+        // If microphone is not enabled and system audio failed, we have nothing to record
+        if !captureMicrophone || microphoneRecorder == nil {
+          Logger.error("No audio sources available - exiting")
+          throw ExitCode.failure
+        }
+      }
+    }
+    
+    if let micRecorder = microphoneRecorder {
+      do {
+        try micRecorder.startRecording()
+      } catch {
+        Logger.error("Failed to start microphone recording", context: ["error": String(describing: error)])
+        Logger.info("Continuing with system audio only (if enabled) or exiting...")
+        microphoneRecorder = nil  // Clear the recorder so we don't try to stop it later
+        
+        // If system audio is not available and microphone failed, we have nothing to record
+        if systemAudioRecorder == nil {
+          Logger.error("No audio sources available - exiting")
+          throw ExitCode.failure
+        }
+      }
+    }
 
     // Run until the run loop is stopped (by signal handler)
     while true {
@@ -151,7 +208,8 @@ struct AudioTee {
     }
 
     Logger.info("Shutting down...")
-    recorder.stopRecording()
+    systemAudioRecorder?.stopRecording()
+    microphoneRecorder?.stopRecording()
   }
 
   private func setupSignalHandlers() {
